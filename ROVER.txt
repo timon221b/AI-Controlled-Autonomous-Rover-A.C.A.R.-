@@ -1,0 +1,87 @@
+Sure. Here is your complete packet structure from `packet.h`:
+
+---
+
+## MotionPacket_t — 14 bytes
+Used for all commands: motion, heartbeat, ACK, abort, resume.
+
+```
+Byte 0    magic[0]      = 0xAB  (always)
+Byte 1    magic[1]      = 0xCD  (always)
+Byte 2    version       = 0x02
+Byte 3    packet_type   = what kind of packet (see below)
+Byte 4    sequence_id   = packet number (for ACK matching)
+Byte 5    total_steps   = how many steps in this sequence
+Byte 6    step_index    = which step this is (0-based)
+Byte 7    command       = what to do (forward, backward, etc)
+Byte 8-9  duration_ms   = how long to run (little endian, 2 bytes)
+Byte 10   speed_pct     = speed 0-100
+Byte 11   flags         = extra options
+Byte 12-13 crc16        = checksum (little endian, 2 bytes)
+```
+
+---
+
+## TelemetryPacket_t — 15 bytes
+Sent from slave to master every 500ms.
+
+```
+Byte 0    magic[0]           = 0xAB
+Byte 1    magic[1]           = 0xCD
+Byte 2    version            = 0x02
+Byte 3    packet_type        = 0x20
+Byte 4    safety_state       = current safety status
+Byte 5    battery_pct        = battery level
+Byte 6-7  obstacle_front_cm  = front distance (little endian)
+Byte 8-9  obstacle_rear_cm   = rear distance (little endian)
+Byte 10   current_step       = step being executed
+Byte 11   total_steps        = total steps in sequence
+Byte 12-13 crc16             = checksum (little endian)
+```
+
+Wait — that's only 14 bytes but defined as 15. Let me recount:
+
+```
+magic(2) + version(1) + type(1) + safety(1) + battery(1) 
++ front(2) + rear(2) + step(1) + total(1) + crc(2) = 14 bytes
+```
+
+**Your `TELEMETRY_PKT_SIZE` is defined as 15 in Python but struct is actually 14 bytes.** This is likely causing your read desync. Fix in `esp_interface.py`:
+
+```python
+TELEMETRY_PKT_SIZE = 14  # not 15
+```
+
+---
+
+## Packet Types
+
+| Value | Name | Direction | Meaning |
+|-------|------|-----------|---------|
+| 0x01 | PKT_MOTION_STEP | Master→Slave | Execute one motion step |
+| 0x02 | PKT_SEQ_END | Master→Slave | Sequence finished |
+| 0x03 | PKT_ABORT | Master→Slave | Emergency stop |
+| 0x04 | PKT_HEARTBEAT | Master→Slave | Keep-alive ping |
+| 0x05 | PKT_RESUME | Master→Slave | Resume from safe state |
+| 0x10 | PKT_ACK_OK | Slave→Master | Packet accepted |
+| 0x11 | PKT_ACK_REJECTED | Slave→Master | Packet rejected |
+| 0x12 | PKT_SAFE_STATE | Slave→Master | Safety event occurred |
+| 0x20 | PKT_TELEMETRY | Slave→Master | Status update |
+
+---
+
+## Flow for one motion command
+
+```
+Python → Serial → Master ESP32 → ESP-NOW → Slave ESP32
+                                              ↓
+                                         validates packet
+                                              ↓
+                                         sends ACK_OK
+                                              ↓
+Slave ESP32 → ESP-NOW → Master ESP32 → Serial → Python
+                                              ↓
+                                         executes motor
+```
+
+**Fix `TELEMETRY_PKT_SIZE = 14` in esp_interface.py** — that one byte difference was causing your read loop to go out of sync every time a telemetry packet arrived.
