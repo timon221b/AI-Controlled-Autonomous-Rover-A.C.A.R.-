@@ -1,381 +1,567 @@
 # AI-Controlled Autonomous Rover (A.C.A.R.)
 
-An end-to-end autonomous rover system that connects an LLM-powered control layer to a Python host app, a master ESP32, and a slave ESP32 over ESP-NOW.
+An AI-powered autonomous rover platform that combines local speech recognition, natural language understanding, ESP32-based wireless control, and real-time telemetry into a complete robotics system.
 
-## Overview
+The project enables a user to issue natural language voice commands such as:
 
-A.C.A.R. is built around a layered control pipeline:
+* "Move forward for 3 seconds"
+* "Turn left slowly"
+* "What is your battery level?"
+* "Stop immediately"
 
-1. **User / LLM layer** generates a high-level navigation or action plan.
-2. **Python host** converts that plan into structured packets.
-3. **Master ESP32** receives packets over serial and forwards them over ESP-NOW.
-4. **Slave ESP32** validates commands, executes motion, and sends ACK/telemetry back.
-5. **Telemetry loop** keeps the system aware of safety, battery, obstacle distance, and sequence progress.
-
-This repository is designed so the rover can be controlled safely, step-by-step, with packet acknowledgements and periodic telemetry.
+The command is processed by the AI layer, converted into motion packets, transmitted wirelessly through ESP-NOW, and executed by the rover in real time.
 
 ---
 
-## Features
+# System Architecture
 
-* LLM-assisted command generation
-* Packet-based motion control
-* ACK / reject / safe-state responses
-* Heartbeat and resume support
-* Periodic telemetry from rover to controller
-* Sequence-based execution with step indexing
-* Safety-oriented communication flow
+```text
+User Voice
+    │
+    ▼
+faster-whisper (Speech-to-Text)
+    │
+    ▼
+Intent Classifier
+    │
+    ├── HARDWARE_MOTION
+    │       │
+    │       ▼
+    │   Motion Parser
+    │       │
+    │       ▼
+    │  Packet Generator
+    │
+    ├── HARDWARE_QUERY
+    │
+    └── CONVERSATION
+            │
+            ▼
+        Ollama + Qwen
+            │
+            ▼
+      Natural Language Response
 
----
-
-## System Architecture
-
-### Main components
-
-* **Python host application**
-
-  * Receives LLM output
-  * Converts commands into packets
-  * Sends packets to the master ESP32 through serial
-  * Reads ACK / telemetry packets coming back
-
-* **Master ESP32**
-
-  * Bridges serial communication and ESP-NOW
-  * Forwards motion packets to the slave
-  * Returns slave responses to Python
-
-* **Slave ESP32**
-
-  * Receives packets over ESP-NOW
-  * Validates packet content and CRC
-  * Executes motion commands
-  * Sends ACK, safety, and telemetry packets back
-
-* **LLM layer**
-
-  * Produces natural-language or structured navigation instructions
-  * Can be used for planning, decision-making, or command generation
-
----
-
-## Packet Structure
-
-### 1) MotionPacket_t — 14 bytes
-
-Used for motion, heartbeat, ACK, abort, and resume workflows.
-
-| Byte(s) | Field       | Description                             |
-| ------- | ----------- | --------------------------------------- |
-| 0       | magic[0]    | 0xAB                                    |
-| 1       | magic[1]    | 0xCD                                    |
-| 2       | version     | 0x02                                    |
-| 3       | packet_type | Packet type identifier                  |
-| 4       | sequence_id | Packet number for ACK matching          |
-| 5       | total_steps | Number of steps in the full sequence    |
-| 6       | step_index  | Current step index (0-based)            |
-| 7       | command     | Motion/action command                   |
-| 8–9     | duration_ms | Duration in milliseconds, little-endian |
-| 10      | speed_pct   | Speed from 0–100                        |
-| 11      | flags       | Extra options                           |
-| 12–13   | crc16       | CRC16 checksum, little-endian           |
-
-### 2) TelemetryPacket_t — 14 bytes
-
-Sent from slave to master every 500 ms.
-
-| Byte(s) | Field             | Description                            |
-| ------- | ----------------- | -------------------------------------- |
-| 0       | magic[0]          | 0xAB                                   |
-| 1       | magic[1]          | 0xCD                                   |
-| 2       | version           | 0x02                                   |
-| 3       | packet_type       | 0x20                                   |
-| 4       | safety_state      | Current safety state                   |
-| 5       | battery_pct       | Battery percentage                     |
-| 6–7     | obstacle_front_cm | Front obstacle distance, little-endian |
-| 8–9     | obstacle_rear_cm  | Rear obstacle distance, little-endian  |
-| 10      | current_step      | Current executing step                 |
-| 11      | total_steps       | Total steps in sequence                |
-| 12–13   | crc16             | CRC16 checksum, little-endian          |
-
-> Important: `TELEMETRY_PKT_SIZE` should be **14**, not 15.
+                    Serial (USB)
+Python Host ─────────────────────────► Master ESP32
+                                          │
+                                          ▼
+                                   ESP-NOW Network
+                                          │
+                                          ▼
+                                     Slave ESP32
+                                          │
+                                          ▼
+                                  Motor Driver + Sensors
+```
 
 ---
 
-## Packet Types
+# Repository Structure
 
-| Value | Name             | Direction      | Meaning                 |
-| ----- | ---------------- | -------------- | ----------------------- |
-| 0x01  | PKT_MOTION_STEP  | Master → Slave | Execute one motion step |
-| 0x02  | PKT_SEQ_END      | Master → Slave | Sequence finished       |
-| 0x03  | PKT_ABORT        | Master → Slave | Emergency stop          |
-| 0x04  | PKT_HEARTBEAT    | Master → Slave | Keep-alive ping         |
-| 0x05  | PKT_RESUME       | Master → Slave | Resume from safe state  |
-| 0x10  | PKT_ACK_OK       | Slave → Master | Packet accepted         |
-| 0x11  | PKT_ACK_REJECTED | Slave → Master | Packet rejected         |
-| 0x12  | PKT_SAFE_STATE   | Slave → Master | Safety event occurred   |
-| 0x20  | PKT_TELEMETRY    | Slave → Master | Status update           |
-
----
-
-## Workflow
-
-### End-to-end flow
-
-1. **User gives a command**
-
-   * Example: “Move forward 2 meters, then turn left.”
-
-2. **LLM interprets the request**
-
-   * The LLM can convert user intent into a structured motion plan.
-   * Output should be broken into steps that the rover can execute safely.
-
-3. **Python host builds packets**
-
-   * Each step becomes a `MotionPacket_t`.
-   * Packet fields are filled with sequence ID, step index, command, duration, speed, and CRC.
-
-4. **Python sends packet to master ESP32 over serial**
-
-   * The master acts as the bridge between PC and rover network.
-
-5. **Master forwards packet over ESP-NOW**
-
-   * The packet is relayed to the slave ESP32.
-
-6. **Slave validates the packet**
-
-   * Checks magic bytes, version, packet type, and CRC.
-   * If valid, it responds with `PKT_ACK_OK`.
-   * If invalid, it responds with `PKT_ACK_REJECTED`.
-
-7. **Slave executes motion**
-
-   * Motor control runs according to the command and duration.
-
-8. **Slave sends telemetry every 500 ms**
-
-   * Safety state
-   * Battery level
-   * Front and rear obstacle distances
-   * Current step and total steps
-
-9. **Master relays telemetry and ACK back to Python**
-
-   * Python updates control state and decides the next step.
-
-10. **Sequence completes**
-
-* Master sends `PKT_SEQ_END` when all steps are finished.
+```text
+AI-Controlled-Autonomous-Rover-A.C.A.R.-/
+│
+├── .gitignore
+├── README.md
+├── ROVER.code-workspace
+├── ROVER.txt
+│
+├── rover_ai/
+│   ├── main.py
+│   ├── esp_interface.py
+│   ├── intent_classifier.py
+│   ├── motion_parser.py
+│   └── orchestrator.py
+│
+├── rover_slave/
+│   ├── .gitignore
+│   ├── platformio.ini
+│   ├── include/
+│   │   ├── README
+│   │   ├── config.h
+│   │   ├── crc16.h
+│   │   ├── motors.h
+│   │   └── packet.h
+│   ├── lib/
+│   │   └── README
+│   └── src/
+│       └── main.cpp
+│
+└── rvr_master/
+    ├── .gitignore
+    ├── platformio.ini
+    ├── include/
+    │   ├── README
+    │   ├── config.h
+    │   ├── crc16.h
+    │   └── packet.h
+    ├── lib/
+    │   └── README
+    └── src/
+        └── main.cpp
+```
 
 ---
 
-## Setup
+# Hardware Requirements
 
-### Prerequisites
+| Component                 | Quantity |
+| ------------------------- | -------- |
+| ESP32 DevKit V1           | 2        |
+| L298N Motor Driver        | 1        |
+| DC Gear Motors            | 2–4      |
+| HC-SR04 Ultrasonic Sensor | 2        |
+| Battery Pack              | 1        |
+| USB Cable                 | 2        |
+| Chassis & Wheels          | 1        |
 
-* Python 3.10+ on the host machine
-* ESP32 toolchain / Arduino IDE / PlatformIO for ESP32 firmware
-* Serial connection between PC and master ESP32
-* ESP-NOW communication configured between master and slave ESP32
-* Compatible motor driver / rover hardware
+---
 
-### Python environment
+# Software Requirements
 
-Create and activate a virtual environment:
+## Python
+
+* Python 3.10+
+* pip
+* virtualenv
+
+## ESP32 Development
+
+* PlatformIO
+* Arduino Framework
+* ESP32 Board Support Package
+
+## AI Stack
+
+* Ollama
+* Qwen 2
+* Faster Whisper
+
+---
+
+# Installation
+
+## 1. Clone Repository
+
+```bash
+git clone https://github.com/timon221b/AI-Controlled-Autonomous-Rover-A.C.A.R.-.git
+
+cd AI-Controlled-Autonomous-Rover-A.C.A.R.-
+```
+
+---
+
+## 2. Create Python Environment
+
+### Linux / macOS
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # Linux / macOS
-# .venv\Scripts\activate    # Windows
+source .venv/bin/activate
 ```
 
-Install dependencies:
+### Windows
+
+```powershell
+python -m venv .venv
+
+.venv\Scripts\activate
+```
+
+---
+
+## 3. Install Python Dependencies
 
 ```bash
+pip install --upgrade pip
+
 pip install -r requirements.txt
 ```
 
-If the project uses separate packages for the LLM or serial stack, install them as well.
-
----
-
-## Configuration
-
-Before running the system, verify these values:
-
-* Serial port for the master ESP32
-* Baud rate used by Python and firmware
-* ESP-NOW peer MAC addresses
-* Packet magic bytes and version
-* CRC16 algorithm on both sender and receiver
-* Telemetry packet size: **14 bytes**
-* Motor command mapping
-* Safety thresholds for obstacle distance and battery percentage
-
----
-
-## Running the System
-
-### 1. Flash the ESP32 firmware
-
-Flash both boards with the corresponding firmware:
-
-* **Master ESP32 firmware**
-* **Slave ESP32 firmware**
-
-Ensure that ESP-NOW peer pairing is configured correctly.
-
-### 2. Start the Python host
-
-Run the Python controller:
+If requirements.txt is unavailable:
 
 ```bash
+pip install pyserial
+pip install numpy
+pip install requests
+pip install faster-whisper
+pip install sounddevice
+pip install python-dotenv
+```
+
+---
+
+# Ollama Setup
+
+Install Ollama from:
+
+https://ollama.com
+
+Verify installation:
+
+```bash
+ollama --version
+```
+
+---
+
+## Download Qwen Model
+
+Lightweight version:
+
+```bash
+ollama pull qwen2:1.5b
+```
+
+Larger version:
+
+```bash
+ollama pull qwen2:7b
+```
+
+Test model:
+
+```bash
+ollama run qwen2:1.5b "Hello Rover"
+```
+
+---
+
+## Start Ollama Service
+
+```bash
+ollama serve
+```
+
+Default endpoint:
+
+```text
+http://localhost:11434
+```
+
+---
+
+# ESP32 Firmware Setup
+
+Both ESP32 projects use PlatformIO.
+
+Install PlatformIO:
+
+```bash
+pip install platformio
+```
+
+---
+
+## Flash Slave ESP32
+
+```bash
+cd rover_slave
+
+platformio run -e esp32doit-devkit-v1
+
+platformio run -t upload -e esp32doit-devkit-v1
+
+platformio run -t monitor -e esp32doit-devkit-v1
+```
+
+Expected:
+
+```text
+[SLAVE] ESP-NOW initialized
+[SLAVE] Waiting for packets...
+```
+
+---
+
+## Flash Master ESP32
+
+```bash
+cd rvr_master
+
+platformio run -e esp32doit-devkit-v1
+
+platformio run -t upload -e esp32doit-devkit-v1
+
+platformio run -t monitor -e esp32doit-devkit-v1
+```
+
+Expected:
+
+```text
+[MASTER] Serial bridge ready
+[MASTER] ESP-NOW initialized
+```
+
+---
+
+# ESP-NOW Configuration
+
+Update peer MAC addresses in:
+
+```text
+rvr_master/include/config.h
+rover_slave/include/config.h
+```
+
+Example:
+
+```cpp
+uint8_t slave_mac[6] = {
+    0xAA,
+    0xBB,
+    0xCC,
+    0xDD,
+    0xEE,
+    0xFF
+};
+```
+
+Replace with actual hardware MAC address.
+
+---
+
+# Serial Configuration
+
+Default baud rate:
+
+```text
+115200
+```
+
+Example Python configuration:
+
+```python
+SERIAL_PORT = "COM3"
+BAUD_RATE = 115200
+```
+
+Linux:
+
+```python
+SERIAL_PORT = "/dev/ttyUSB0"
+```
+
+---
+
+# Running the System
+
+Start Ollama:
+
+```bash
+ollama serve
+```
+
+Activate environment:
+
+```bash
+source .venv/bin/activate
+```
+
+Run rover controller:
+
+```bash
+cd rover_ai
+
 python main.py
 ```
 
-(or the repository’s entry file, if named differently)
+Expected output:
 
-### 3. Send a command
-
-Provide either:
-
-* a natural language prompt to the LLM, or
-* a structured motion request
-
-The host will convert it into packets and begin the motion sequence.
-
-### 4. Monitor telemetry and ACKs
-
-The Python app should continuously receive:
-
-* ACK status
-* safety events
-* telemetry updates
-* sequence completion notifications
-
----
-
-## LLM Integration
-
-The LLM acts as the planning layer, not the low-level motor layer.
-
-### Suggested LLM responsibility
-
-* Convert user intent into a safe step sequence
-* Split large instructions into smaller motion actions
-* Normalize outputs into a consistent schema
-* Avoid generating ambiguous commands
-
-### Suggested structured output
-
-```json
-{
-  "sequence": [
-    { "command": "forward", "duration_ms": 2000, "speed_pct": 60 },
-    { "command": "left", "duration_ms": 900, "speed_pct": 50 }
-  ]
-}
+```text
+Loading Whisper Model...
+Connecting to ESP32...
+Starting Telemetry Thread...
+Rover Ready
+Press Enter To Speak
 ```
 
-The Python layer should validate this output before sending packets.
+---
 
-### Recommended flow for LLM setup
+# Communication Protocol
 
-1. Accept user instruction.
-2. Ask the LLM to return a structured motion plan.
-3. Validate the plan against allowed commands.
-4. Convert each step into a packet.
-5. Execute step-by-step with ACK checks.
-6. Stop immediately if a safety packet or reject is received.
+## Motion Packet
+
+Size:
+
+```text
+14 Bytes
+```
+
+Fields:
+
+```text
+Magic
+Version
+Packet Type
+Sequence ID
+Total Steps
+Step Index
+Command
+Duration
+Speed
+Flags
+CRC16
+```
 
 ---
 
-## Safety and Recovery
+## Telemetry Packet
 
-The rover should stop or pause when any of the following occurs:
+Size:
 
-* CRC mismatch
-* Invalid magic bytes
-* Unsupported packet type
-* Safety state trigger
-* Obstacle threshold violation
-* Low battery warning
-* Lost heartbeat
+```text
+14 Bytes
+```
 
-Recovery can be handled using:
+Fields:
 
-* `PKT_ABORT` for immediate stop
-* `PKT_RESUME` for restarting from a safe state
-* `PKT_HEARTBEAT` for keep-alive monitoring
+```text
+Safety State
+Battery Percentage
+Obstacle Distance Front
+Obstacle Distance Rear
+Current Step
+Total Steps
+CRC16
+```
 
 ---
 
-## Troubleshooting
+# Important Fix
 
-### Telemetry packets are misread
+In:
 
-Check that `TELEMETRY_PKT_SIZE = 14`.
+```text
+rover_ai/esp_interface.py
+```
 
-### ACKs are not arriving
+Use:
 
-Verify:
+```python
+TELEMETRY_PKT_SIZE = 14
+```
 
-* ESP-NOW peer MAC address
-* same packet version on both ends
-* CRC16 implementation
-* serial parsing boundaries
+NOT:
 
-### Commands execute incorrectly
+```python
+TELEMETRY_PKT_SIZE = 15
+```
 
-Confirm that the command enum mapping is identical in:
+Using 15 causes telemetry desynchronization and packet corruption.
 
-* Python host
-* master ESP32
-* slave ESP32
+---
 
-### Sequence desync
+# End-to-End Workflow
+
+```text
+Voice Command
+      │
+      ▼
+Speech Recognition
+      │
+      ▼
+Intent Classification
+      │
+      ▼
+Motion Parsing
+      │
+      ▼
+Packet Generation
+      │
+      ▼
+Master ESP32
+      │
+      ▼
+ESP-NOW
+      │
+      ▼
+Slave ESP32
+      │
+      ▼
+Motor Execution
+      │
+      ▼
+Telemetry Feedback
+      │
+      ▼
+Python Host
+```
+
+---
+
+# Troubleshooting
+
+### ESP32 Not Detected
+
+```bash
+platformio device list
+```
+
+---
+
+### Serial Permission Error
+
+Linux:
+
+```bash
+sudo usermod -a -G dialout $USER
+```
+
+Logout and login again.
+
+---
+
+### Force Clean Build
+
+```bash
+platformio run -t clean
+
+platformio run
+```
+
+---
+
+### Ollama Connection Refused
+
+```bash
+ollama serve
+```
+
+must be running before starting the rover.
+
+---
+
+### No Telemetry Received
 
 Check:
 
-* `sequence_id`
-* `step_index`
-* `total_steps`
-* whether a packet was dropped or rejected
-
----
-
-## Suggested Repository Structure
-
-```bash
-.
-├── esp_interface.py
-├── main.py
-├── packet.py / packet.h
-├── llm/
-├── firmware/
-│   ├── master/
-│   └── slave/
-├── requirements.txt
-└── README.md
+```python
+TELEMETRY_PKT_SIZE = 14
 ```
 
----
-
-## Notes for Contributors
-
-* Keep packet layouts synchronized across Python and firmware.
-* Any packet field change must be reflected in CRC calculation.
-* Do not change telemetry packet size unless both sender and receiver are updated.
-* Validate LLM output before generating motion packets.
+and verify Master ↔ Slave ESP-NOW pairing.
 
 ---
 
+# Future Improvements
 
+* Camera integration
+* Vision-based navigation
+* Obstacle avoidance with AI planning
+* Multi-rover coordination
+* GPS waypoint navigation
+* Remote dashboard
+* Autonomous mission execution
 
 ---
 
-## Acknowledgements
 
-Built for autonomous rover control using ESP32, Python, serial communication, ESP-NOW, and LLM-based planning.
+# Author
+
+Ansh Kashyap, Darshan Malviya, Krishna Kodape
+
+Electronics & Telecommunication Engineering
+
+AI-Controlled Autonomous Rover (A.C.A.R.)
